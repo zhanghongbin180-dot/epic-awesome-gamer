@@ -8,7 +8,6 @@ from pathlib import Path
 from hcaptcha_challenger.agent import AgentConfig
 from pydantic import Field, SecretStr
 from pydantic_settings import SettingsConfigDict
-# 引入 loguru 以便在补丁中打印清晰日志
 from loguru import logger
 
 # --- 核心路径定义 ---
@@ -25,7 +24,6 @@ HCAPTCHA_DIR = VOLUMES_DIR.joinpath("hcaptcha")
 class EpicSettings(AgentConfig):
     model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
 
-    # 类型修复：必须是 SecretStr
     GEMINI_API_KEY: SecretStr | None = Field(
         default_factory=lambda: os.getenv("GEMINI_API_KEY"),
         description="AiHubMix 的令牌",
@@ -66,21 +64,19 @@ settings = EpicSettings()
 settings.ignore_request_questions = ["Please drag the crossing to complete the lines"]
 
 # ==========================================
-# [增强版] AiHubMix 终极补丁
+# [修复版] AiHubMix 终极补丁 (自包含 helper 函数)
 # ==========================================
 def _apply_aihubmix_patch():
     if not settings.GEMINI_API_KEY:
         return
 
     try:
-        # 1. 尝试导入核心库
         from google import genai
         from google.genai import types
         
-        # 2. 优先劫持 Client 初始化 (这是最关键的一步，必须成功)
+        # 1. 劫持 Client 初始化 (路径修正)
         orig_init = genai.Client.__init__
         def new_init(self, *args, **kwargs):
-            # 解密 Key
             if hasattr(settings.GEMINI_API_KEY, 'get_secret_value'):
                 api_key = settings.GEMINI_API_KEY.get_secret_value()
             else:
@@ -88,7 +84,6 @@ def _apply_aihubmix_patch():
             
             kwargs['api_key'] = api_key
             
-            # 路径修正
             base_url = settings.GEMINI_BASE_URL.rstrip('/')
             if base_url.endswith('/v1'): base_url = base_url[:-3]
             if not base_url.endswith('/gemini'): base_url = f"{base_url}/gemini"
@@ -99,12 +94,13 @@ def _apply_aihubmix_patch():
         
         genai.Client.__init__ = new_init
 
-        # 3. 尝试劫持文件上传 (这步如果失败，不应该影响上面的 URL 劫持)
+        # 2. 劫持文件上传 (绕过 400/403 错误)
         try:
-            # 这里的导入比较脆弱，可能会因为版本更新而失败
-            from google.genai._common import _contents_to_list
-            
             file_cache = {}
+
+            # [关键修复] 自己定义 helper，不依赖 google 内部库
+            def _local_to_list(c):
+                return c if isinstance(c, list) else [c]
 
             async def patched_upload(self_files, file, **kwargs):
                 if hasattr(file, 'read'): content = file.read()
@@ -114,31 +110,34 @@ def _apply_aihubmix_patch():
                 
                 if asyncio.iscoroutine(content): content = await content
                 
+                # 伪造文件上传，实际只存内存
                 file_id = f"bypass_{id(content)}"
                 file_cache[file_id] = content
                 return types.File(name=file_id, uri=file_id, mime_type="image/png")
 
             orig_generate = genai.models.AsyncModels.generate_content
             async def patched_generate(self_models, model, contents, **kwargs):
-                normalized = _contents_to_list(contents)
+                # 使用我们自己的 helper
+                normalized = _local_to_list(contents)
+                
                 for content in normalized:
-                    for i, part in enumerate(content.parts):
-                        if part.file_data and part.file_data.file_uri in file_cache:
-                            data = file_cache[part.file_data.file_uri]
-                            content.parts[i] = types.Part.from_bytes(data=data, mime_type="image/png")
+                    if hasattr(content, 'parts'):
+                        for i, part in enumerate(content.parts):
+                            # 如果发现是我们伪造的文件 ID，立马替换成 Base64
+                            if part.file_data and part.file_data.file_uri in file_cache:
+                                data = file_cache[part.file_data.file_uri]
+                                content.parts[i] = types.Part.from_bytes(data=data, mime_type="image/png")
+                
                 return await orig_generate(self_models, model, normalized, **kwargs)
 
             genai.files.AsyncFiles.upload = patched_upload
             genai.models.AsyncModels.generate_content = patched_generate
-            logger.info("🚀 Base64 文件绕过补丁加载成功")
+            logger.info("🚀 Base64 文件绕过补丁加载成功 (独立版)")
             
-        except ImportError as ie:
-            # 如果仅仅是内部工具导入失败，不要崩坏，只打印警告
-            logger.warning(f"⚠️ 文件绕过补丁加载失败 (可能库版本不兼容): {ie}")
-            logger.warning("⚠️ 程序将尝试使用原生上传，如果遇到 400 错误请更新库版本")
+        except Exception as ie:
+            logger.warning(f"⚠️ 文件绕过补丁依然失败: {ie}")
 
     except Exception as e:
-        # 这里打印出具体的错误信息，方便我们调试
         logger.error(f"❌ 严重：AiHubMix 补丁加载完全失败! 原因: {e}")
 
 # 执行补丁
