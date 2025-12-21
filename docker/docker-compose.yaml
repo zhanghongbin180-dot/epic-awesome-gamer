@@ -2,21 +2,25 @@ name: epic-awesome-gamer
 
 services:
   epic-awesome-gamer:
-#    build:
-#      context: ..
-#      dockerfile: docker/Dockerfile
-    image: ghcr.io/qin2dim/epic-awesome-gamer:latest
+    # 🔴 请确保这里的 image 是您自己的 GitHub 用户名
+    image: ghcr.io/10000ge10000/epic-awesome-gamer:latest
+    
     restart: "no"
     container_name: epic-awesome-gamer
     env_file:
       - .env
+    
+    # ✅ [核心修改] 数据持久化配置
+    # 将宿主机的 ./volumes 目录映射到容器内的 /app/app/volumes 目录
+    # 这样您的 登录Cookie、截图、日志 都会保存在本地，重启容器不会丢失
     volumes:
       - "./volumes/:/app/app/volumes/"
+      
     entrypoint: [ "/usr/bin/tini", "--" ]
     command: xvfb-run --auto-servernum --server-num=1 --server-args='-screen 0, 1920x1080x24' uv run app/deploy.py
 
-    # Limit maximum memory to 4GB to prevent C++ memory leaks
+    # 限制最大内存为 4GB，防止 C++ 内存泄漏导致服务器卡死
     mem_limit: 4g
 
-    # Allocate enough shared memory for Playwright/Chrome to prevent crashes or slowdowns
+    # 分配足够的共享内存给 Playwright/Chrome，防止崩溃或变慢
     shm_size: '2gb'
