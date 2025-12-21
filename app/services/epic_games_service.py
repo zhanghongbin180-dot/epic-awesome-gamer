@@ -170,22 +170,14 @@ class EpicGames:
     @staticmethod
     async def _active_purchase_container(page: Page):
         logger.debug("Scanning for purchase iframe...")
-        
-        # [修改点 1] 使用更宽泛的 iframe 选择器
-        # 匹配 ID 包含 webPurchaseContainer 或者 src 包含 purchase 的 iframe
         iframe_selector = "//iframe[contains(@id, 'webPurchaseContainer') or contains(@src, 'purchase')]"
         wpc = page.frame_locator(iframe_selector).first
 
-        # [修改点 2] 优先使用文本匹配 "PLACE ORDER" (对应你的截图)
-        # 忽略大小写，寻找按钮
         logger.debug("Looking for 'PLACE ORDER' button...")
-        
-        # 尝试几个可能的定位器
         place_order_btn = wpc.locator("button", has_text="PLACE ORDER")
         confirm_btn = wpc.locator("//button[contains(@class, 'payment-confirm__btn')]")
         
         try:
-            # 优先等待文字匹配的按钮
             await expect(place_order_btn).to_be_visible(timeout=15000)
             logger.debug("✅ Found 'PLACE ORDER' button via text match")
             return wpc, place_order_btn
@@ -193,14 +185,11 @@ class EpicGames:
             pass
             
         try:
-            # 备选：尝试之前的类名匹配
             await expect(confirm_btn).to_be_visible(timeout=5000)
             logger.debug("✅ Found button via CSS class match")
             return wpc, confirm_btn
         except AssertionError:
-            # 最后的备选：有些地区可能是 "CHECKOUT" 或其他
-            logger.warning("Primary buttons not found, dumping frame content for debug...")
-            # 抛出异常前记录一下，方便后续排查（如果有）
+            logger.warning("Primary buttons not found in iframe.")
             raise AssertionError("Could not find Place Order button in iframe")
 
     @staticmethod
@@ -213,29 +202,46 @@ class EpicGames:
                 return True
 
     async def _handle_instant_checkout(self, page: Page):
-        """处理点击 'Get' 后弹出的即时结账窗口"""
+        """处理点击 'Get' 后弹出的即时结账窗口 (加强版)"""
         logger.info("🚀 Triggering Instant Checkout Flow...")
-        
         agent = AgentV(page=page, agent_config=settings)
 
         try:
-            # 1. 等待并定位 iframe 里的 Place Order 按钮
+            # 1. 定位按钮
             wpc, payment_btn = await self._active_purchase_container(page)
             
-            # 2. 点击下单
+            # 2. 第一次点击
             logger.debug(f"Clicking payment button: {await payment_btn.text_content()}")
-            # 强制点击，防止有时候被遮挡
             await payment_btn.click(force=True)
             
-            # 3. 处理可能的验证码
+            # 3. 处理验证码
             logger.debug("Checking for CAPTCHA...")
+            # 等待一小会儿看验证码是否弹出
+            await page.wait_for_timeout(3000)
+            
+            # 如果触发了验证码逻辑
             await agent.wait_for_challenge()
             
-            logger.success("🎉 Instant Checkout Clicked! Waiting for confirmation...")
+            # 4. [关键] 二次确认逻辑
+            # 验证码解决后，检查“下单”按钮是否还在。如果还在，说明订单没提交，需要再点一次。
+            logger.debug("Verifying if order needs re-submission...")
+            if await payment_btn.is_visible():
+                logger.warning("⚠️ Payment button still visible after CAPTCHA. Clicking again...")
+                await payment_btn.click(force=True)
             
+            # 5. [关键] 等待成功信号
+            # 成功的标志通常是：按钮消失、Iframe 消失、或 URL 改变
+            logger.info("Waiting for order confirmation (button to disappear)...")
+            try:
+                # 等待按钮消失（即弹窗关闭）
+                await expect(payment_btn).to_be_hidden(timeout=20000)
+                logger.success("🎉 Instant Checkout Successful (Window closed)!")
+            except AssertionError:
+                logger.error("❌ Order confirmation timed out! Button still visible.")
+                # 截图留证（可选，需配合框架支持）
+                
         except Exception as err:
             logger.error(f"Instant checkout failed: {err}")
-            # 遇到错误尝试刷新页面
             await page.reload()
 
     async def add_promotion_to_cart(self, page: Page, urls: List[str]) -> bool:
@@ -244,7 +250,7 @@ class EpicGames:
         for url in urls:
             await page.goto(url, wait_until="load")
 
-            # 1. 处理弹窗 (Continue)
+            # 1. 处理弹窗
             try:
                 continue_btn = page.locator("//button//span[text()='Continue']")
                 if await continue_btn.is_visible(timeout=5000):
@@ -288,13 +294,11 @@ class EpicGames:
                 text = await target_btn.text_content()
                 
                 if "Get" in text:
-                    # === 即时结账流程 ===
                     logger.debug(f"👉 Found 'Get' button, starting instant checkout - {url=}")
                     await target_btn.click()
                     await self._handle_instant_checkout(page)
                     
                 elif "Add To Cart" in text:
-                    # === 购物车流程 ===
                     logger.debug(f"🛒 Found 'Add To Cart' button - {url=}")
                     await target_btn.click()
                     with suppress(TimeoutError):
@@ -352,7 +356,6 @@ class EpicGames:
     @retry(retry=retry_if_exception_type(TimeoutError), stop=stop_after_attempt(2), reraise=True)
     async def collect_weekly_games(self, promotions: List[PromotionGame]):
         urls = [p.url for p in promotions]
-        
         has_cart_items = await self.add_promotion_to_cart(self.page, urls)
 
         if has_cart_items:
